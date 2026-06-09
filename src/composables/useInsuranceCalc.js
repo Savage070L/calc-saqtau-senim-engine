@@ -6,6 +6,7 @@ import { ref, computed } from 'vue';
 import { ActuarialEngine } from '../core/actuarial.js';
 import { PolicyCalculator } from '../core/calculator.js';
 import { RidersCalculator } from '../core/riders.js';
+import { calculateIndexationSchedule } from '../core/indexation.js';
 import { PRODUCT_CONFIG } from '../config/product.js';
 import { useI18n } from '../i18n/index.js';
 
@@ -163,6 +164,9 @@ export function useInsuranceCalc() {
         annuityFrequency = 'annual',
         annuityTerm = 0,
         guaranteedPeriod = 0,
+        enableIndexation = false,
+        indexRate = 7,        // в процентах: 7 == 7 %
+        indexYears = 5,
         riders: ridersSelection = {},
         kMult = 1.0,
         lAdd = 0.0,
@@ -252,15 +256,48 @@ export function useInsuranceCalc() {
       const totalPremium = finalResult.grossPremium + totalRiderPremium;
       const maturityAmount = finalResult.sumAssured;
 
-      // Страховая сумма по доп. покрытию не может превышать СС по основному.
+      // ─── Пост-валидация результата ───────────────────────────────────────
+      //   1. СС по доп. покрытию не должна превышать СС по основному.
+      //   2. Для детей 7-16 лет СС по основному ≤ 5 000 000 ₸.
+      // При нарушении — расчёт не отображается.
       const { t: ti } = useI18n();
       const finalSA = finalResult.sumAssured;
+      const postErrs = [];
+
       const hasRiderOverSA = Object.values(allowedRidersSelection).some(
         (r) => r?.enabled && typeof r.sum === 'number' && r.sum > finalSA,
       );
-      if (hasRiderOverSA) {
-        errors.value = [...errors.value, ti('errors.riderSumExceedsSA')];
+      if (hasRiderOverSA) postErrs.push(ti('errors.riderSumExceedsSA'));
+
+      const CHILD_MIN_AGE = 7, CHILD_MAX_AGE = 16, CHILD_MAX_SA = 5_000_000;
+      if (x >= CHILD_MIN_AGE && x <= CHILD_MAX_AGE && finalSA > CHILD_MAX_SA) {
+        postErrs.push(ti('errors.childMaxSA', {
+          age: x,
+          min: CHILD_MIN_AGE,
+          max: CHILD_MAX_AGE,
+          sa:  formatMoney(CHILD_MAX_SA, '₸'),
+        }));
+      }
+
+      if (postErrs.length > 0) {
+        errors.value = [...errors.value, ...postErrs];
         error.value = errors.value.join('; ');
+        result.value = null;
+        return;
+      }
+
+      // ── Индексация (опциональный блок) ────────────────────────────────────
+      // Считается только для единовременного взноса (как в эталонном Excel).
+      let indexationSchedule = [];
+      if (enableIndexation && frequency === 'single'
+          && finalSA > 0 && indexRate > 0 && indexYears > 0) {
+        indexationSchedule = calculateIndexationSchedule({
+          dob, gender, term, frequency,
+          initialSumAssured: finalSA,
+          indexRate: indexRate / 100,   // вход в %, передаём как долю
+          indexYears,
+          engine: getEngine().engine,
+        });
       }
 
       result.value = {
@@ -270,6 +307,10 @@ export function useInsuranceCalc() {
         totalPremium,
         maturityAmount,
         annuityPayment: enableAnnuity ? finalResult.annuityPayment : 0,
+        indexationSchedule,
+        enableIndexation,
+        indexRate,
+        indexYears,
         calcDate: new Date().toISOString().slice(0, 10),
       };
     } catch (e) {
